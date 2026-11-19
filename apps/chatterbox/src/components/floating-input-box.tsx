@@ -1,13 +1,17 @@
+import { effect } from '@preact/signals'
 import { IconArrowsMove, IconMinus } from '@tabler/icons-preact'
 import { cn } from 'cn'
 import type { TargetedMouseEvent, TargetedPointerEvent } from 'preact'
 import { useEffect, useRef, useState } from 'preact/hooks'
 
 import {
-  type AnchorBox,
+  findChatAnchorElement,
+  getViewportSize,
+  observeChatAnchor,
+  readChatAnchorBox,
+} from '../lib/floating-input-anchor'
+import {
   clampFloatingRect,
-  FLOATING_INPUT_MIN_HEIGHT,
-  FLOATING_INPUT_MIN_WIDTH,
   type FloatingRect,
   moveFloatingRect,
   type ResizeEdge,
@@ -23,7 +27,15 @@ import {
   submitNormalSend,
 } from '../lib/normal-send'
 import { startPointerDrag } from '../lib/pointer-drag'
-import { fasongText, floatingInputEnabled, floatingInputMinimized, normalSendYolo } from '../lib/store'
+import {
+  dialogOpen,
+  dialogWidth,
+  fasongText,
+  floatingInputEnabled,
+  floatingInputMinimized,
+  normalSendYolo,
+  optimizeLayout,
+} from '../lib/store'
 import { getGraphemes } from '../lib/utils'
 import { EmoteSelector } from './emote-selector'
 import { FansMedalSelector } from './fans-medal-selector'
@@ -36,39 +48,6 @@ const RESIZE_HANDLES: Array<{ edge: ResizeEdge; className: string; cursor: strin
   { edge: 'ne', className: 'top-0 right-0 size-2.5', cursor: 'nesw-resize', title: '拖动调整大小' },
   { edge: 'se', className: 'bottom-0 right-0 size-2.5', cursor: 'nwse-resize', title: '拖动调整大小' },
 ]
-
-const CHAT_ANCHOR_SELECTORS = [
-  '#chat-control-panel-vm',
-  '.control-panel-ctnr',
-  '#aside-area-vm',
-  '.aside-area',
-] as const
-
-function getViewportSize(): ViewportSize {
-  return {
-    width: document.documentElement.clientWidth || window.innerWidth,
-    height: document.documentElement.clientHeight || window.innerHeight,
-  }
-}
-
-function findChatAnchorElement(): HTMLElement | null {
-  if (typeof document === 'undefined') return null
-  for (const selector of CHAT_ANCHOR_SELECTORS) {
-    const el = document.querySelector<HTMLElement>(selector)
-    if (!el) continue
-    const rect = el.getBoundingClientRect()
-    if (rect.width >= FLOATING_INPUT_MIN_WIDTH && rect.height >= FLOATING_INPUT_MIN_HEIGHT) {
-      return el
-    }
-  }
-  return null
-}
-
-function readChatAnchorBox(el: HTMLElement | null): AnchorBox | null {
-  if (!el?.isConnected) return null
-  const r = el.getBoundingClientRect()
-  return { right: r.right, bottom: r.bottom, width: r.width, height: r.height }
-}
 
 function sameRect(a: FloatingRect, b: FloatingRect): boolean {
   return a.right === b.right && a.bottom === b.bottom && a.width === b.width && a.height === b.height
@@ -127,67 +106,23 @@ export function FloatingInputBox() {
   useEffect(() => {
     if (!enabled || customRect !== null) return
 
-    let raf = 0
-    let observedAnchor: HTMLElement | null = null
-    let observedAppBody: HTMLElement | null = null
-    let watchingSubtree = false
-    let observingBody = false
-
-    const scheduleSync = () => {
-      if (!raf) raf = requestAnimationFrame(syncAnchor)
-    }
-
-    const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(scheduleSync) : null
-    resizeObserver?.observe(document.documentElement)
-
-    const mutationObserver = typeof MutationObserver !== 'undefined' ? new MutationObserver(scheduleSync) : null
-
-    const syncAnchor = () => {
-      raf = 0
-      const vp = getViewportSize()
+    const handle = observeChatAnchor((vp, anchorBox) => {
       setViewport(prev => (sameViewport(prev, vp) ? prev : vp))
-
-      const nextAnchor = findChatAnchorElement()
-      if (nextAnchor !== observedAnchor) {
-        if (observedAnchor) resizeObserver?.unobserve(observedAnchor)
-        observedAnchor = nextAnchor
-        if (observedAnchor) resizeObserver?.observe(observedAnchor)
-      }
-
-      const appBody = document.querySelector<HTMLElement>('.app-body')
-      if (appBody !== observedAppBody) {
-        if (observedAppBody) resizeObserver?.unobserve(observedAppBody)
-        observedAppBody = appBody
-        if (observedAppBody) resizeObserver?.observe(observedAppBody)
-      }
-
-      if (mutationObserver && document.body) {
-        if (!observedAnchor && (!observingBody || !watchingSubtree)) {
-          mutationObserver.disconnect()
-          mutationObserver.observe(document.body, { childList: true, subtree: true })
-          observingBody = true
-          watchingSubtree = true
-        } else if (observedAnchor && (!observingBody || watchingSubtree)) {
-          // Drop subtree observation once mounted so chat message insertions never wake syncAnchor.
-          mutationObserver.disconnect()
-          mutationObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'style'] })
-          observingBody = true
-          watchingSubtree = false
-        }
-      }
-
-      const next = resolveDefaultFloatingRect(vp, readChatAnchorBox(observedAnchor))
+      const next = resolveDefaultFloatingRect(vp, anchorBox)
       setAutoRect(prev => (sameRect(prev, next) ? prev : next))
-    }
+    })
 
-    window.addEventListener('resize', scheduleSync)
-    syncAnchor()
+    // Subscribe outside render so dragging `dialogWidth` re-syncs without re-rendering the input box.
+    const disposeLayoutSignals = effect(() => {
+      void optimizeLayout.value
+      void dialogOpen.value
+      void dialogWidth.value
+      handle.schedule()
+    })
 
     return () => {
-      cancelAnimationFrame(raf)
-      window.removeEventListener('resize', scheduleSync)
-      resizeObserver?.disconnect()
-      mutationObserver?.disconnect()
+      disposeLayoutSignals()
+      handle.dispose()
     }
   }, [enabled, customRect])
 
